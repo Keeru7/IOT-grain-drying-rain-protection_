@@ -1,0 +1,456 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
+#include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+// ---------- THINGSPEAK ----------
+#include <HTTPClient.h>
+
+#define TS_API_KEY "CX6TOVXYVJTI0RTU"
+#define TS_SERVER  "http://api.thingspeak.com/update"
+
+unsigned long lastTSUpdate = 0;
+#define TS_INTERVAL 20000   // 20 seconds (ThingSpeak limit)
+
+// ---------- WiFi ----------
+const char* ssid = "ACTFIBERNET";
+const char* password = "act12345";
+
+// ---------- TELEGRAM ----------
+#define BOT_TOKEN "8503216696:AAHKWG_KHcf0eelg9cw31FL9m4GlLWbPotg"
+#define CHAT_ID   "6809397316"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+// -------- SENSORS --------
+#define DHTTYPE DHT11
+#define DHTPIN 15
+#define DHT2_PIN 4
+#define SOIL_SENSOR 35
+#define SOIL_SENSOR_2 32
+#define RAIN_SENSOR 34
+#define PIR_PIN 5
+#define BUZZER_PIN 16
+// -------- LIMIT SWITCHES (REED / END STOP) --------
+#define LIMIT_OPEN   18
+#define LIMIT_CLOSE  19
+
+DHT dht(DHTPIN, DHTTYPE);
+DHT dht2(DHT2_PIN, DHTTYPE);
+
+// Soil calibration
+int soilDry = 800;
+int soilWet = 2500;
+
+// -------- MOTORS / L298N --------
+// Roof / Sheed
+#define IN1 14
+#define IN2 12
+#define ENA 25
+
+// Pump
+#define PUMP_IN2 26
+#define PUMP_EN 27
+
+// Rotor
+#define ROTOR_IN2 23
+#define ROTOR_EN 33
+
+// Fan
+#define FAN_IN2 17
+#define FAN_EN 2
+
+// PWM settings
+#define PWM_FREQ 1000
+#define PWM_RES 8
+
+// Motor speeds
+int roofSpeed = 150;
+int pumpSpeed = 100;
+int rotorSpeed = 100;
+int fanSpeed = 0;
+
+// Status flags
+String roofStatus = "IDLE";
+bool rainMsgSent = false;
+bool fireMsgSent = false;
+
+// Fire temperature threshold
+#define FIRE_TEMP 50   // °C
+
+// Periodic status
+unsigned long lastStatusTime = 0;
+#define STATUS_INTERVAL 300000 // 5 min
+unsigned long mixInterval = 5UL * 60UL * 1000UL; // 5 minutes
+unsigned long mixDuration = 20000;                 // 20 seconds
+unsigned long lastMixTime = 0;
+
+// Rotor timer
+unsigned long lastRotorTime = 0;
+
+bool rotorRunning = false;
+unsigned long rotorStartTime = 0;
+
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+int soilPercent = 0;
+int soilPercent2 = 0;
+int pirState = 0;
+bool pirAlertSent = false;
+
+// =================================================
+// SETUP
+// =================================================
+void setup() {
+  Serial.begin(115200);
+
+  // -------- PWM setup ----------
+  ledcSetup(0, PWM_FREQ, PWM_RES); // Roof
+  ledcAttachPin(ENA, 0);
+  ledcWrite(0, 0);
+
+  ledcSetup(1, PWM_FREQ, PWM_RES); // Pump
+  ledcAttachPin(PUMP_EN, 1);
+  ledcWrite(1, 0);
+
+  ledcSetup(2, PWM_FREQ, PWM_RES); // Rotor
+  ledcAttachPin(ROTOR_EN, 2);
+  ledcWrite(2, 0);
+
+  ledcSetup(3, PWM_FREQ, PWM_RES); // Fan
+  ledcAttachPin(FAN_EN, 3);
+  ledcWrite(3, 0);
+
+  // -------- Pins ----------
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(PUMP_IN2, OUTPUT);
+  pinMode(ROTOR_IN2, OUTPUT);
+  pinMode(FAN_IN2, OUTPUT);
+
+  pinMode(LIMIT_OPEN, INPUT_PULLUP);
+  pinMode(LIMIT_CLOSE, INPUT_PULLUP);
+
+  pinMode(RAIN_SENSOR, INPUT);
+  pinMode(SOIL_SENSOR, INPUT);
+  pinMode(SOIL_SENSOR_2, INPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  dht.begin();
+  dht2.begin();
+
+  lcd.begin();
+  lcd.backlight();
+  motorStop();
+
+  // -------- WIFI ----------
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  WiFi.begin(ssid, password);
+  client.setInsecure();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  lcd.clear();
+  lcd.print("WiFi Connected");
+  Serial.println("WiFi Connected!");
+  bot.sendMessage(CHAT_ID, "Auto Roof System Started!\nESP32 Online & Monitoring...", "");
+  delay(1500);
+}
+void sendToThingSpeak(
+  float temp1,
+  float hum1,
+  int soil1,
+  int soil2,
+  int rain,
+  int pir,
+  float temp2,
+  float hum2
+) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(TS_SERVER) +
+               "?api_key=" + TS_API_KEY +
+               "&field1=" + String(temp1, 1) +
+               "&field2=" + String(hum1, 1) +
+               "&field3=" + String(soil1) +
+               "&field4=" + String(soil2) +
+               "&field5=" + String(rain) +
+               "&field6=" + String(pir) +
+               "&field7=" + String(temp2, 1) +
+               "&field8=" + String(hum2, 1);
+
+  http.begin(url);
+  http.GET();
+  http.end();
+
+  Serial.println("ThingSpeak updated");
+}
+
+
+// =================================================
+// MOTOR CONTROL
+// =================================================
+void motorOpen() {
+  Serial.println("Roof OPENING");
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  ledcWrite(0, roofSpeed);
+}
+void motorClose() {
+  Serial.println("Roof CLOSING");
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  ledcWrite(0, roofSpeed);
+}
+void motorStop() {
+  Serial.println("Roof STOPPED");
+  ledcWrite(0, 0);
+}
+
+// =================================================
+// OPEN / CLOSE ROOF
+// =================================================
+void openRoof() {
+  roofStatus = "OPENING";
+  updateLCD();
+  bot.sendMessage(CHAT_ID, "RAIN + Soil >50%\nOpening Roof...", "");
+  motorOpen();
+  while (digitalRead(LIMIT_OPEN) == HIGH) delay(5);
+  motorStop();
+  roofStatus = "OPEN";
+  updateLCD();
+  bot.sendMessage(CHAT_ID, "Roof Fully OPEN", "");
+}
+
+void closeRoof() {
+  roofStatus = "CLOSING";
+  updateLCD();
+  motorClose();
+  while (digitalRead(LIMIT_CLOSE) == HIGH) delay(5);
+  motorStop();
+  roofStatus = "CLOSED";
+  updateLCD();
+  bot.sendMessage(CHAT_ID, "Roof Fully CLOSED", "");
+}
+
+// =================================================
+// LCD UPDATE
+// =================================================
+void updateLCD() {
+  float h1 = dht.readHumidity();
+  float t1 = dht.readTemperature();
+
+  float h2 = dht2.readHumidity();
+  float t2 = dht2.readTemperature();
+
+  soilPercent = map(analogRead(SOIL_SENSOR), soilDry, soilWet, 100, 0);
+  soilPercent = constrain(soilPercent, 0, 100);
+
+  soilPercent2 = map(analogRead(SOIL_SENSOR_2), soilDry, soilWet, 100, 0);
+  soilPercent2 = constrain(soilPercent2, 0, 100);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("T2:");
+  lcd.print(t2, 0);
+  lcd.print("C H2:");
+  lcd.print(h2, 0);
+
+  lcd.setCursor(0, 1);
+  lcd.print("S1:");
+  lcd.print(soilPercent);
+  lcd.print("% S2:");
+  lcd.print(soilPercent2);
+}
+
+// =================================================
+// LOOP
+// =================================================
+void loop() {
+  // Read sensors
+ 
+
+  int rain = digitalRead(RAIN_SENSOR);
+  bool raining = (rain == LOW);
+  float hum2 = dht2.readHumidity();
+ 
+  float temp1 = dht.readTemperature();  // DHT1 temperature
+float hum1 = dht.readHumidity(); // DHT1 humidity
+float temp2 = dht2.readTemperature(); // DHT2 temperature
+
+// ============ THINGSPEAK UPDATE ============
+if (millis() - lastTSUpdate >= TS_INTERVAL) {
+  lastTSUpdate = millis();
+
+ 
+sendToThingSpeak(
+  temp1,
+  hum1,
+  soilPercent,
+  soilPercent2,
+  raining ? 1 : 0,
+  pirState,
+  temp2,
+  hum2
+);
+
+}
+
+  // PIR + buzzer
+  pirState = digitalRead(PIR_PIN);
+  digitalWrite(BUZZER_PIN, pirState ? HIGH : LOW);
+// ===== PIR TELEGRAM ALERT =====
+if (pirState == HIGH && !pirAlertSent) {
+  bot.sendMessage(
+    CHAT_ID,
+    "🚨 MOTION DETECTED!\nPIR sensor triggered  motion detected.",
+    ""
+  );
+  pirAlertSent = true;
+}
+
+// Reset alert when motion stops
+if (pirState == LOW) {
+  pirAlertSent = false;
+}
+
+  
+  // 1) BOTH Rain + Soil > 50 → OPEN ROOF
+  if (raining && soilPercent > 50) {
+    rainMsgSent = false; // reset rain-only flag
+    if (roofStatus != "OPEN" && roofStatus != "OPENING") {
+      openRoof();
+    }
+  }
+
+  // 2) ONLY RAIN (soil <= 50%) → send rain alert
+  if (raining && soilPercent <= 50) {
+    if (!rainMsgSent) {
+      bot.sendMessage(CHAT_ID,
+        "Rain detected but soil ≤ 50%\nRoof remains CLOSED.",
+        ""
+      );
+      rainMsgSent = true;
+    }
+    if (roofStatus != "CLOSED" && roofStatus != "CLOSING") {
+      closeRoof();
+    }
+  }
+
+  // 3) No rain AND soil ≤ 50 → normal close
+  if (!raining ) {
+    rainMsgSent = false;
+    if (roofStatus != "CLOSED" && roofStatus != "CLOSING") {
+      closeRoof();
+    }
+  }
+  // FIRE ALERT
+  if (temp1 > FIRE_TEMP && !fireMsgSent) {
+    bot.sendMessage(CHAT_ID, "🔥 FIRE ALERT! Temperature HIGH: " + String(temp1) + "C", "");
+    fireMsgSent = true;
+  } else if (temp1 <= FIRE_TEMP) fireMsgSent = false;
+
+  // ================= PUMP CONTROL =================
+
+// 🌧️ If raining → PUMP OFF (highest priority)
+if (raining) {
+  digitalWrite(PUMP_IN2, LOW);
+   ledcWrite(1, 0);
+}
+
+// ☀️ If NOT raining → soil-based pump control
+else {
+  if (soilPercent < 50 || soilPercent2 < 50) {
+    digitalWrite(PUMP_IN2, HIGH);
+   ledcWrite(1, pumpSpeed); // PWM pump
+  } else {
+    digitalWrite(PUMP_IN2, LOW);
+      ledcWrite(1, 0);
+  }
+}
+
+
+ 
+unsigned long now = millis();
+
+
+
+// START rotor every 1 minute
+if (!rotorRunning && now - lastMixTime >= mixInterval) {
+  rotorRunning = true;
+  rotorStartTime = now;
+  lastMixTime = now;
+
+  Serial.println("Rotor ON");
+  digitalWrite(ROTOR_IN2, HIGH);
+  ledcWrite(2, rotorSpeed);
+}
+
+// STOP rotor after 20 seconds
+if (rotorRunning && now - rotorStartTime >= mixDuration) {
+  rotorRunning = false;
+
+  Serial.println("Rotor OFF");
+  digitalWrite(ROTOR_IN2, LOW);
+  ledcWrite(2, 0);
+}
+
+
+
+  if (hum2 > 45) {
+  digitalWrite(FAN_IN2, HIGH);
+  ledcWrite(3, 250);
+} else {
+  ledcWrite(3, 0);
+}
+
+
+static bool humAlertSent = false;
+
+if (hum2 > 45 && !humAlertSent) {
+ bot.sendMessage(
+  CHAT_ID,
+  "💧 HUMIDITY ALERT!\n\n"
+  "Sensor-2 Humidity: " + String(hum2) + "%\n"
+  "Sensor-2 Temp: " + String(temp2) + "C\n\n"
+  "Rotor & Fan ON",
+  ""
+);
+
+  humAlertSent = true;
+}
+if (hum2 <= 45) humAlertSent = false;
+
+
+  // Update LCD
+  updateLCD();
+
+  // PERIODIC STATUS
+  if (millis() - lastStatusTime >= STATUS_INTERVAL) {
+    lastStatusTime = millis();
+    String statusMsg =
+  "🌡️ Temp1: " + String(temp1, 1) + "C\n" +
+  "💧 Hum1: " + String(hum1, 1) + "%\n\n" +
+
+  "🌡️ Temp2: " + String(temp2, 1) + "C\n" +
+  "💧 Hum2: " + String(hum2, 1) + "%\n\n" +
+
+  "🌱 Soil1: " + String(soilPercent) + "%\n" +
+  "🌱 Soil2: " + String(soilPercent2) + "%\n" +
+  "🏠 Roof: " + roofStatus;
+
+    bot.sendMessage(CHAT_ID, statusMsg, "");
+  }
+
+  delay(700);
+}
